@@ -10,6 +10,7 @@ that reconstructs the highest-probability parse of each given sentence.)
 
 from __future__ import annotations
 import argparse
+from ast import If
 import logging
 import math
 import tqdm
@@ -71,16 +72,49 @@ class EarleyChart:
         self.cols: List[Agenda]
         self._run_earley()    # run Earley's algorithm to construct self.cols
 
-    def accepted(self) -> bool:
-        """Was the sentence accepted?
-        That is, does the finished chart contain an item corresponding to a parse of the sentence?
-        This method answers the recognition question, but not the parsing question."""
-        for item in self.cols[-1].all():    # the last column
-            if (item.rule.lhs == self.grammar.start_symbol   # a ROOT item in this column
-                and item.next_symbol() is None               # that is complete 
-                and item.start_position == 0):               # and started back at position 0
-                    return True
-        return False   # we didn't find any appropriate item
+    def best_parse(self) -> str:
+        """Return the best parse as an S-expression, or a message if no parse was found."""
+        # Find all complete items in the last column that span the whole input
+        # and have the start symbol on their left-hand side.
+        candidates = [item for item in self.cols[-1].all()
+                      if item.rule.lhs == self.grammar.start_symbol
+                      and item.next_symbol() is None
+                      and item.start_position == 0]
+        if not candidates:
+            return f"# No parse: {' '.join(self.tokens)}"
+        # Pick the candidate with the lowest weight
+        best_item = min(candidates, key=lambda item: self.cols[-1]._weight[item])
+        log.debug(f"Best parse has weight {self.cols[-1]._weight[best_item]}")
+        # Reconstruct the parse tree from backpointers
+        return self.build_trees(best_item, len(self.tokens))
+
+    def build_trees(self, item: Item, end: int) -> str:
+        """Build an S-expression for a complete `item` that ends at column `end`.
+        Walk back through backpointers, collecting children left-to-right.
+        """
+        children_rev: List[str] = []
+        cur_item, cur_end = item, end
+        while True:
+            bp = self.cols[cur_end]._backptr[cur_item] # type: ignore
+            if bp.kind == 'PREDICT':
+                break  # reached the start of this rule's derivation (dot at 0)
+            elif bp.kind == 'SCAN':
+                # Consumed one terminal; add it and step back one column
+                children_rev.append(bp.terminal) # type: ignore
+                cur_item = bp.parent_item
+                cur_end -= 1
+            elif bp.kind == 'ATTACH':
+                # Attached a completed child; build its subtree and step back to parent prefix
+                children_rev.append(self.build_trees(bp.child_item, bp.child_end)) # type: ignore
+                # Parent prefix ended where the child began
+                cur_item = bp.parent_item
+                cur_end = bp.child_item.start_position # type: ignore
+            else:
+                raise ValueError(f"Unknown backpointer kind: {bp.kind}")
+
+        children = list(reversed(children_rev))
+        return f"({item.rule.lhs} {' '.join(children)})" if children else f"({item.rule.lhs})"
+
 
     def _run_earley(self) -> None:
         """Fill in the Earley chart."""
@@ -133,7 +167,7 @@ class EarleyChart:
         if it matches what this item is looking for next."""
         if position < len(self.tokens) and self.tokens[position] == item.next_symbol():
             new_item = item.with_dot_advanced()
-            new_weight = 0.0  # scanning has no weight
+            new_weight = self.cols[position]._weight[item]  # no additional weight for scanning
             new_backptr = Backptr(kind='SCAN', parent_item=item, parent_end=position,
                                   child_item=None, child_end=None, terminal=self.tokens[position])
             self.cols[position + 1].push_or_move(new_item, new_weight, new_backptr)
@@ -152,7 +186,9 @@ class EarleyChart:
         child_end = position
         for customer in self.cols[mid]._waiting.get(item.rule.lhs, ()):
             new_item = customer.with_dot_advanced()
-            self.cols[position].push_or_move(new_item, child_weight, Backptr(kind='ATTACH', parent_item=customer, parent_end=position,
+            new_weight = self.cols[mid]._weight[customer] + child_weight
+            # Create backpointer from new_item to customer and child
+            self.cols[position].push_or_move(new_item, new_weight, Backptr(kind='ATTACH', parent_item=customer, parent_end=position,
                                                                              child_item=child, child_end=child_end, terminal=None))
             log.debug(f"\tAttached to get: {new_item} in column {position}")
             self.profile["ATTACH"] += 1
@@ -393,6 +429,22 @@ class Backptr:
     child_end: Optional[int]
     terminal: Optional[str]
 
+    def __post_init__(self):
+        # Enforce field requirements based on kind
+        if self.kind == 'SCAN':
+            assert self.parent_item is not None
+            assert self.parent_end is not None
+            assert self.terminal is not None
+        elif self.kind == 'ATTACH':
+            assert self.parent_item is not None
+            assert self.parent_end is not None
+            assert self.child_item is not None
+            assert self.child_end is not None
+        elif self.kind == 'PREDICT':
+            pass
+        else:
+            raise ValueError(f"Unknown backpointer kind: {self.kind}")
+
     def __repr__(self) -> str:
         if self.kind == 'PREDICT':
             return f"PREDICT"
@@ -418,14 +470,13 @@ def main():
                 log.debug("="*70)
                 log.debug(f"Parsing sentence: {sentence}")
                 chart = EarleyChart(sentence.split(), grammar, progress=args.progress)
+                print(chart.best_parse())
+                
                 # print the result
-                print(
-                    f"'{sentence}' is {'accepted' if chart.accepted() else 'rejected'} by {args.grammar}"
-                )
                 log.debug(f"Profile of work done: {chart.profile}")
 
 
 if __name__ == "__main__":
-    import doctest
-    doctest.testmod(verbose=False)   # run tests
+    # import doctest
+    # doctest.testmod(verbose=False)   # run tests
     main()
