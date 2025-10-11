@@ -16,7 +16,7 @@ import tqdm
 from dataclasses import dataclass
 from pathlib import Path
 from collections import Counter
-from typing import Counter as CounterType, Iterable, List, Optional, Dict, Tuple
+from typing import Counter as CounterType, Iterable, List, Optional, Dict, Tuple, Literal
 
 log = logging.getLogger(Path(__file__).stem)  # For usage, see findsim.py in earlier assignment.
 
@@ -121,7 +121,10 @@ class EarleyChart:
         """Start looking for this nonterminal at the given position."""
         for rule in self.grammar.expansions(nonterminal):
             new_item = Item(rule, dot_position=0, start_position=position)
-            self.cols[position].push(new_item)
+            new_weight = rule.weight
+            new_backptr = Backptr(kind='PREDICT', parent_item=None, parent_end=None,
+                                  child_item=None, child_end=None, terminal=None)
+            self.cols[position].push_or_move(new_item, new_weight, new_backptr)
             log.debug(f"\tPredicted: {new_item} in column {position}")
             self.profile["PREDICT"] += 1
 
@@ -130,7 +133,10 @@ class EarleyChart:
         if it matches what this item is looking for next."""
         if position < len(self.tokens) and self.tokens[position] == item.next_symbol():
             new_item = item.with_dot_advanced()
-            self.cols[position + 1].push(new_item)
+            new_weight = 0.0  # scanning has no weight
+            new_backptr = Backptr(kind='SCAN', parent_item=item, parent_end=position,
+                                  child_item=None, child_end=None, terminal=self.tokens[position])
+            self.cols[position + 1].push_or_move(new_item, new_weight, new_backptr)
             log.debug(f"\tScanned to get: {new_item} in column {position+1}")
             self.profile["SCAN"] += 1
 
@@ -140,12 +146,16 @@ class EarleyChart:
         called "complete," but actually it attaches an item that was already complete.)
         """
         mid = item.start_position   # start position of this item = end position of item to its left
-        for customer in self.cols[mid].all():  # could you eliminate this inefficient linear search?
-            if customer.next_symbol() == item.rule.lhs:
-                new_item = customer.with_dot_advanced()
-                self.cols[position].push(new_item)
-                log.debug(f"\tAttached to get: {new_item} in column {position}")
-                self.profile["ATTACH"] += 1
+        # Use the column's index of waiting customers to avoid linear scan
+        child = item
+        child_weight = self.cols[position]._weight[child]
+        child_end = position
+        for customer in self.cols[mid]._waiting.get(item.rule.lhs, ()):
+            new_item = customer.with_dot_advanced()
+            self.cols[position].push_or_move(new_item, child_weight, Backptr(kind='ATTACH', parent_item=customer, parent_end=position,
+                                                                             child_item=child, child_end=child_end, terminal=None))
+            log.debug(f"\tAttached to get: {new_item} in column {position}")
+            self.profile["ATTACH"] += 1
 
 
 class Agenda:
@@ -196,6 +206,12 @@ class Agenda:
         self._items: List[Item] = []       # list of all items that were *ever* pushed
         self._index: Dict[Item, int] = {}  # stores index of an item if it was ever pushed
         self._next = 0                     # index of first item that has not yet been popped
+        # Index of items by their next symbol (terminal or nonterminal), for fast lookup
+        # of customers during attach. Items with next_symbol() is None are not indexed.
+        self._waiting: Dict[str, List[Item]] = {}
+
+        self._weight: Dict[Item, float] = {} # stores weight of each item
+        self._backptr: Dict[Item, Backptr] = {} # stores backpointers for each item
 
         # Note: There are other possible designs.  For example, self._index doesn't really
         # have to store the index; it could be changed from a dictionary to a set.  
@@ -209,12 +225,40 @@ class Agenda:
         Enables `len(my_agenda)`."""
         return len(self._items) - self._next
 
-    def push(self, item: Item) -> None:
-        """Add (enqueue) the item, unless it was previously added."""
-        if item not in self._index:    # O(1) lookup in hash table
+    # def push(self, item: Item) -> None:
+    #     """Add (enqueue) the item, unless it was previously added."""
+    #     if item not in self._index:    # O(1) lookup in hash table
+    #         self._items.append(item)
+    #         self._index[item] = len(self._items) - 1
+    #         sym = item.next_symbol()
+    #         if sym is not None:
+    #             self._waiting.setdefault(sym, []).append(item)
+
+    def push_or_move(self, item: Item, weight: float, backptr: Backptr) -> None:
+        """Add (enqueue) the item, unless it was previously added.
+        If it was previously added with a higher weight, update its weight and backpointer."""
+        idx = self._index.get(item)
+        if idx is None:
             self._items.append(item)
             self._index[item] = len(self._items) - 1
-            
+            sym = item.next_symbol()
+            if sym is not None:
+                self._waiting.setdefault(sym, []).append(item)
+            self._weight[item] = weight
+            self._backptr[item] = backptr
+        elif weight < self._weight[item]:
+            self._weight[item] = weight
+            self._backptr[item] = backptr
+            if idx < self._next:
+                # if item already popped (idx < _next), swap it with _items[_next-1],
+                # update the two _index entries, then do _next -= 1 to “unpop” it in O(1).
+                last_idx = self._next - 1
+                if idx != last_idx:  # no need to swap if it's already at _next-1
+                    self._items[idx], self._items[last_idx] = self._items[last_idx], self._items[idx]
+                    self._index[self._items[idx]] = idx
+                    self._index[self._items[last_idx]] = last_idx
+                self._next -= 1
+
     def pop(self) -> Item:
         """Returns one of the items that was waiting to be popped (dequeued).
         Raises IndexError if there are no items waiting."""
@@ -301,7 +345,7 @@ class Rule:
     def __repr__(self) -> str:
         """Complete string used to show this rule instance at the command line"""
         # Note: You might want to modify this to include the weight.
-        return f"{self.lhs} → {' '.join(self.rhs)}"
+        return f"{self.lhs} → {' '.join(self.rhs)} ({self.weight})"
 
     
 # We particularly want items to be immutable, since they will be hashed and 
@@ -339,6 +383,25 @@ class Item:
         dotted_rule = f"{self.rule.lhs} → {' '.join(rhs)}"
         return f"({self.start_position}, {dotted_rule})"  # matches notation on slides
 
+@dataclass
+class Backptr:
+    """Backpointer information for an item."""
+    kind: Literal['PREDICT', 'SCAN', 'ATTACH']
+    parent_item: Optional[Item]
+    parent_end: Optional[int]
+    child_item: Optional[Item]
+    child_end: Optional[int]
+    terminal: Optional[str]
+
+    def __repr__(self) -> str:
+        if self.kind == 'PREDICT':
+            return f"PREDICT"
+        elif self.kind == 'SCAN':
+            return f"SCAN '{self.terminal}'"
+        elif self.kind == 'ATTACH':
+            return f"ATTACH from {self.child_item} at {self.child_end} to {self.parent_item} at {self.parent_end}"
+        else:
+            return "UNKNOWN BACKPTR"
 
 def main():
     # Parse the command-line arguments
