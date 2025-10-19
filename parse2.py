@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from collections import Counter, deque
 from typing import Counter as CounterType, Iterable, List, Optional, Dict, Tuple, Literal
+from integerize import Integerizer
 
 log = logging.getLogger(Path(__file__).stem)  # For usage, see findsim.py in earlier assignment.
 
@@ -60,7 +61,7 @@ def parse_args() -> argparse.Namespace:
 class EarleyChart:
     """A chart for Earley's algorithm."""
     
-    def __init__(self, tokens: List[str], grammar: SentenceGrammar, progress: bool = False) -> None:
+    def __init__(self, tokens: List[str], grammar: Grammar, progress: bool = False) -> None:
         """Create the chart based on parsing `tokens` with `grammar`.  
         `progress` says whether to display progress bars as we parse."""
         self.tokens = tokens
@@ -70,14 +71,16 @@ class EarleyChart:
 
         self.cols: List[Agenda]
 
-        # E.2 gating via terminal reachability: allow only NTs that can reach
-        # at least one token from this sentence (plus start symbol)
-        sent_vocab = set(self.tokens)
-        self._allow_nt: set = set()
-        for lhs in self.grammar._trie.keys():
-            if self.grammar._reachable_terminals.get(lhs, set()) & sent_vocab:
-                self._allow_nt.add(lhs)
-        self._allow_nt.add(self.grammar.start_symbol)
+        # Integerize input tokens once
+        self._token_ids: List[Optional[int]] = [self.grammar.symbol_id(tok) for tok in self.tokens]
+        # E.2 gating via terminal reachability: allow only nonterminals that can reach
+        # at least one token from this sentence (plus the start symbol)
+        sentence_vocab_ids = {tid for tid in self._token_ids if tid is not None}
+        self._allow_nonterminal_ids: set[int] = set()
+        for lhs_id in self.grammar._trie.keys():
+            if self.grammar._reachable_terminals.get(lhs_id, set()) & sentence_vocab_ids:
+                self._allow_nonterminal_ids.add(lhs_id)
+        self._allow_nonterminal_ids.add(self.grammar.start_symbol_id)
 
         self._run_earley()    # run Earley's algorithm to construct self.cols
 
@@ -86,7 +89,7 @@ class EarleyChart:
         # Find all complete items in the last column that span the whole input
         # and have the start symbol on their left-hand side.
         candidates = [item for item in self.cols[-1].all()
-                      if item.lhs == self.grammar.start_symbol
+                      if item.lhs == self.grammar.start_symbol_id
                       and item.start_position == 0
                       and self.grammar.get_weight(item.lhs, item.state) is not None]
         if not candidates:
@@ -122,7 +125,8 @@ class EarleyChart:
                 raise ValueError(f"Unknown backpointer kind: {bp.kind}")
 
         children = list(reversed(children_rev))
-        return f"({item.lhs} {' '.join(children)})" if children else f"({item.lhs})"
+        label = self.grammar.symbol_from_id(item.lhs)
+        return f"({label} {' '.join(children)})" if children else f"({label})"
 
 
     def _run_earley(self) -> None:
@@ -131,7 +135,7 @@ class EarleyChart:
         self.cols = [Agenda(self.grammar) for _ in range(len(self.tokens) + 1)]
 
         # Start looking for ROOT at position 0
-        self._predict(self.grammar.start_symbol, 0)
+        self._predict(self.grammar.start_symbol_id, 0)
 
         # We'll go column by column, and within each column row by row.
         # Processing earlier entries in the column may extend the column
@@ -155,22 +159,22 @@ class EarleyChart:
                     self._attach(item, i)
 
                 # Even if final, there may also be next symbols; continue to predict/scan
-                for sym in grammar.next_nonterminals(item.lhs, item.state):
-                    if sym in self._allow_nt:
+                for sym_id in grammar.next_nonterminals(item.lhs, item.state):
+                    if sym_id in self._allow_nonterminal_ids:
                         # Predict this nonterminal at this position
-                        log.debug(f"{item} => PREDICT {sym}")
-                        self._predict(sym, i)
+                        log.debug(f"{item} => PREDICT {self.grammar.symbol_from_id(sym_id)}")
+                        self._predict(sym_id, i)
 
                 # Scan the next word if it matches what this item is looking for next
                 if i < len(tokens):
                     self._scan(item, i)
                     log.debug(f"{item} => SCAN '{tokens[i]}'")
 
-    def _predict(self, nonterminal: str, position: int) -> None:
+    def _predict(self, nonterminal_id: int, position: int) -> None:
         """Start looking for this nonterminal at the given position."""
-        if nonterminal not in self._allow_nt:
+        if nonterminal_id not in self._allow_nonterminal_ids:
             return
-        new_item = Item(lhs=nonterminal, state=0, start_position=position)
+        new_item = Item(lhs=nonterminal_id, state=0, start_position=position)
         new_backptr = Backptr(kind='PREDICT', parent_item=None, parent_end=None,
                                 child_item=None, child_end=None, terminal=None)
         cols = self.cols
@@ -184,7 +188,8 @@ class EarleyChart:
         tokens = self.tokens
         grammar = self.grammar
         cols = self.cols
-        child_state = grammar.advance(item.lhs, item.state, tokens[position]) if position < len(tokens) else None
+        token_id = self._token_ids[position] if position < len(tokens) else None
+        child_state = grammar.advance(item.lhs, item.state, token_id) if token_id is not None else None
         if child_state is not None:
             new_item = Item(lhs=item.lhs, state=child_state, start_position=item.start_position)
             new_weight = cols[position]._weight[item]  # no additional weight for scanning
@@ -265,13 +270,13 @@ class Agenda:
 
     """
 
-    def __init__(self, grammar: 'SentenceGrammar') -> None:
+    def __init__(self, grammar: 'Grammar') -> None:
         self._items: List[Item] = []       # list of all items that were *ever* pushed
         self._index: Dict[Item, int] = {}  # stores index of an item if it was ever pushed
         self._next = 0                     # index of first item that has not yet been popped
         # Index of items by their next symbol (terminal or nonterminal), for fast lookup
         # of customers during attach. Items with next_symbol() is None are not indexed.
-        self._waiting: Dict[str, List[Item]] = {}
+        self._waiting: Dict[int, List[Item]] = {}
 
         self._weight: Dict[Item, float] = {} # stores weight of each item
         self._backptr: Dict[Item, Backptr] = {} # stores backpointers for each item
@@ -300,8 +305,8 @@ class Agenda:
 
     def _index_waiting(self, item: Item) -> None:
         # Register item under each next nonterminal symbol from its trie state
-        for sym in self._grammar.next_nonterminals(item.lhs, item.state):
-            self._waiting.setdefault(sym, []).append(item)
+        for next_nt_id in self._grammar.next_nonterminals(item.lhs, item.state):
+            self._waiting.setdefault(next_nt_id, []).append(item)
 
     def push_or_move(self, item: Item, weight: float, backptr: Backptr) -> None:
         """Add (enqueue) the item, unless it was previously added.
@@ -346,7 +351,9 @@ class Agenda:
         return f"{self.__class__.__name__}({self._items[:next]}; {self._items[next:]})"
 
 class Grammar:
-    """Represents a weighted context-free grammar with tries and reachability."""
+    """Represents a weighted context-free grammar with tries and reachability.
+    Symbols (both nonterminals and terminals) are integerized to reduce hashing and
+    dictionary overhead in the hot path."""
     def __init__(self, start_symbol: str, *files: Path) -> None:
         """Create a grammar with the given start symbol, 
         adding rules from the specified files if any."""
@@ -355,13 +362,19 @@ class Grammar:
         # Read the input grammar files
         for file in files:
             self.add_rules_from_file(file)
-        # Build tries and reachability once
-        self._trie: Dict[str, List[TrieNode]] = {}
-        self._dir_terminals: Dict[str, set] = {}
-        self._adj: Dict[str, set] = {}
-        self._rev_adj: Dict[str, set] = {}
-        self._reachable_terminals: Dict[str, set] = {}
+        # Integerizer for symbols
+        self._symbol_integerizer: Integerizer[str] = Integerizer()
+        # Nonterminal ids set (LHS ids)
+        self._nonterminal_ids: set[int] = set()
+        # Build tries and reachability once (integerized)
+        self._trie: Dict[int, List[TrieNode]] = {}
+        self._dir_terminals: Dict[int, set[int]] = {}
+        self._adj: Dict[int, set[int]] = {}
+        self._rev_adj: Dict[int, set[int]] = {}
+        self._reachable_terminals: Dict[int, set[int]] = {}
         self._build_tries_and_reach()
+        # Cache start symbol id
+        self.start_symbol_id: int = self._symbol_integerizer.index(self.start_symbol)  # type: ignore
 
     def add_rules_from_file(self, file: Path) -> None:
         """Add rules to this grammar from a file (one rule per line).
@@ -393,35 +406,45 @@ class Grammar:
 
     def _build_tries_and_reach(self) -> None:
         # Initialize structures
-        self._dir_terminals = {lhs: set() for lhs in self._expansions.keys()}
-        self._adj = {lhs: set() for lhs in self._expansions.keys()}
-        self._rev_adj = {lhs: set() for lhs in self._expansions.keys()}
-        # Build tries and collect direct terminals and nonterminal dependencies
+        # First integerize all nonterminals
+        for lhs in self._expansions.keys():
+            lhs_id = self._symbol_integerizer.index(lhs, add=True)  # type: ignore
+            self._nonterminal_ids.add(lhs_id)  # type: ignore
+        # Prepare maps keyed by lhs_id
+        self._dir_terminals = {lhs_id: set() for lhs_id in self._nonterminal_ids}
+        self._adj = {lhs_id: set() for lhs_id in self._nonterminal_ids}
+        self._rev_adj = {lhs_id: set() for lhs_id in self._nonterminal_ids}
+        # Build tries (keyed by lhs_id) and collect direct terminals and nonterminal dependencies
         for lhs, rules in self._expansions.items():
+            lhs_id = self._symbol_integerizer.index(lhs)  # type: ignore
             nodes: List[TrieNode] = [TrieNode(children={}, weight=None, nonterm_children=())]
             for rule in rules:
                 cur = 0
                 for sym in rule.rhs:
-                    if self.is_nonterminal(sym):
-                        self._adj[lhs].add(sym)
-                        self._rev_adj.setdefault(sym, set()).add(lhs)
+                    # Integerize symbol
+                    sym_id = self._symbol_integerizer.index(sym, add=True)  # type: ignore
+                    # Track terminals and nonterminal dependencies for reachability
+                    if sym_id in self._nonterminal_ids:
+                        self._adj[lhs_id].add(sym_id)
+                        self._rev_adj.setdefault(sym_id, set()).add(lhs_id)
                     else:
-                        self._dir_terminals.setdefault(lhs, set()).add(sym)
-                    if nodes[cur].children.get(sym) is None:
+                        self._dir_terminals.setdefault(lhs_id, set()).add(sym_id)
+                    if nodes[cur].children.get(sym_id) is None:
                         nodes.append(TrieNode(children={}, weight=None, nonterm_children=()))
-                        nodes[cur].children[sym] = len(nodes) - 1
-                    cur = nodes[cur].children[sym]
+                        nodes[cur].children[sym_id] = len(nodes) - 1
+                    cur = nodes[cur].children[sym_id]
                 if nodes[cur].weight is None or rule.weight < nodes[cur].weight:
                     nodes[cur].weight = rule.weight
+            # Precompute next nonterminal ids per node for quick waiting index
             for nd in nodes:
-                nd.nonterm_children = tuple(sym for sym in nd.children.keys() if self.is_nonterminal(sym))
-            self._trie[lhs] = nodes
-        # Worklist to compute reachable terminals
-        reach: Dict[str, set] = {lhs: set(ts) for lhs, ts in self._dir_terminals.items()}
-        for lhs in self._expansions.keys():
-            reach.setdefault(lhs, set())
-            self._rev_adj.setdefault(lhs, set())
-        q = deque(self._expansions.keys())
+                nd.nonterm_children = tuple(sym_id for sym_id in nd.children.keys() if sym_id in self._nonterminal_ids)
+            self._trie[lhs_id] = nodes
+        # Worklist to compute reachable terminals (keyed by lhs_id)
+        reach: Dict[int, set[int]] = {lhs_id: set(ts) for lhs_id, ts in self._dir_terminals.items()}
+        for lhs_id in self._nonterminal_ids:
+            reach.setdefault(lhs_id, set())
+            self._rev_adj.setdefault(lhs_id, set())
+        q = deque(self._nonterminal_ids)
         while q:
             y = q.popleft()
             Ry = reach[y]
@@ -434,14 +457,22 @@ class Grammar:
                     q.append(p)
         self._reachable_terminals = reach
 
-    def advance(self, lhs: str, state: int, sym: str) -> Optional[int]:
-        return self._trie[lhs][state].children.get(sym)
+    def advance(self, lhs: int, state: int, symbol: Optional[int]) -> Optional[int]:
+        if symbol is None:
+            return None
+        return self._trie[lhs][state].children.get(symbol)
 
-    def get_weight(self, lhs: str, state: int) -> Optional[float]:
+    def get_weight(self, lhs: int, state: int) -> Optional[float]:
         return self._trie[lhs][state].weight
 
-    def next_nonterminals(self, lhs: str, state: int) -> Iterable[str]:
+    def next_nonterminals(self, lhs: int, state: int) -> Iterable[int]:
         return self._trie[lhs][state].nonterm_children
+
+    def symbol_id(self, symbol: str) -> Optional[int]:
+        return self._symbol_integerizer.index(symbol)
+
+    def symbol_from_id(self, symbol_id: int) -> str:
+        return self._symbol_integerizer[symbol_id]
 
 
 # (Merged Grammar; no SentenceGrammar subclass)
@@ -482,12 +513,12 @@ class Rule:
 class Item:
     """An item in the Earley parse chart, representing one or more subtrees
     that could yield a particular substring."""
-    lhs: str
+    lhs: int
     state: int
     start_position: int
 
     def __repr__(self) -> str:
-        return f"({self.start_position}, {self.lhs} at {self.state} state)"
+        return f"({self.start_position}, lhs_id={self.lhs} at {self.state})"
 
 @dataclass
 class Backptr:
@@ -511,10 +542,10 @@ class Backptr:
 
 @dataclass
 class TrieNode:
-    children: Dict[str, int]  # symbol -> child node id
+    children: Dict[int, int]  # symbol_id -> child node id
     weight: Optional[float] = None  # None if not end of rule, ≥0 if end of rule.
     # Precomputed next nonterminal children for faster indexing
-    nonterm_children: Tuple[str, ...] = ()
+    nonterm_children: Tuple[int, ...] = ()
 
 
 
