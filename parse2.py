@@ -10,13 +10,12 @@ that reconstructs the highest-probability parse of each given sentence.)
 
 from __future__ import annotations
 import argparse
-from ast import If
 import logging
 import math
 import tqdm
 from dataclasses import dataclass
 from pathlib import Path
-from collections import Counter
+from collections import Counter, deque
 from typing import Counter as CounterType, Iterable, List, Optional, Dict, Tuple, Literal
 
 log = logging.getLogger(Path(__file__).stem)  # For usage, see findsim.py in earlier assignment.
@@ -61,7 +60,7 @@ def parse_args() -> argparse.Namespace:
 class EarleyChart:
     """A chart for Earley's algorithm."""
     
-    def __init__(self, tokens: List[str], grammar: Grammar, progress: bool = False) -> None:
+    def __init__(self, tokens: List[str], grammar: SentenceGrammar, progress: bool = False) -> None:
         """Create the chart based on parsing `tokens` with `grammar`.  
         `progress` says whether to display progress bars as we parse."""
         self.tokens = tokens
@@ -70,6 +69,16 @@ class EarleyChart:
         self.profile: CounterType[str] = Counter()
 
         self.cols: List[Agenda]
+
+        # E.2 gating via terminal reachability: allow only NTs that can reach
+        # at least one token from this sentence (plus start symbol)
+        sent_vocab = set(self.tokens)
+        self._allow_nt: set = set()
+        for lhs in self.grammar._trie.keys():
+            if self.grammar._reachable_terminals.get(lhs, set()) & sent_vocab:
+                self._allow_nt.add(lhs)
+        self._allow_nt.add(self.grammar.start_symbol)
+
         self._run_earley()    # run Earley's algorithm to construct self.cols
 
     def best_parse(self) -> str:
@@ -77,13 +86,13 @@ class EarleyChart:
         # Find all complete items in the last column that span the whole input
         # and have the start symbol on their left-hand side.
         candidates = [item for item in self.cols[-1].all()
-                      if item.rule.lhs == self.grammar.start_symbol
-                      and item.next_symbol() is None
-                      and item.start_position == 0]
+                      if item.lhs == self.grammar.start_symbol
+                      and item.start_position == 0
+                      and self.grammar.get_weight(item.lhs, item.state) is not None]
         if not candidates:
             return f"# No parse: {' '.join(self.tokens)}"
         # Pick the candidate with the lowest weight
-        best_item = min(candidates, key=lambda item: self.cols[-1]._weight[item])
+        best_item = min(candidates, key=lambda item: self.cols[-1]._weight[item] + self.grammar.get_weight(item.lhs, item.state)) # type: ignore
         log.debug(f"Best parse has weight {self.cols[-1]._weight[best_item]}")
         # Reconstruct the parse tree from backpointers
         return self.build_trees(best_item, len(self.tokens))
@@ -113,13 +122,13 @@ class EarleyChart:
                 raise ValueError(f"Unknown backpointer kind: {bp.kind}")
 
         children = list(reversed(children_rev))
-        return f"({item.rule.lhs} {' '.join(children)})" if children else f"({item.rule.lhs})"
+        return f"({item.lhs} {' '.join(children)})" if children else f"({item.lhs})"
 
 
     def _run_earley(self) -> None:
         """Fill in the Earley chart."""
         # Initially empty column for each position in sentence
-        self.cols = [Agenda() for _ in range(len(self.tokens) + 1)]
+        self.cols = [Agenda(self.grammar) for _ in range(len(self.tokens) + 1)]
 
         # Start looking for ROOT at position 0
         self._predict(self.grammar.start_symbol, 0)
@@ -130,47 +139,58 @@ class EarleyChart:
         # 
         # The iterator over numbered columns is `enumerate(self.cols)`.  
         # Wrapping this iterator in the `tqdm` call provides a progress bar.
-        for i, column in tqdm.tqdm(enumerate(self.cols),
-                                   total=len(self.cols),
+        cols = self.cols
+        tokens = self.tokens
+        grammar = self.grammar
+        for i, column in tqdm.tqdm(enumerate(cols),
+                                   total=len(cols),
                                    disable=not self.progress):
             log.debug("")
             log.debug(f"Processing items in column {i}")
             while column:    # while agenda isn't empty
                 item = column.pop()   # dequeue the next unprocessed item
-                next = item.next_symbol();
-                if next is None:
+                if grammar.get_weight(item.lhs, item.state) is not None:
                     # Attach this complete constituent to its customers
                     log.debug(f"{item} => ATTACH")
-                    self._attach(item, i)   
-                elif self.grammar.is_nonterminal(next):
-                    # Predict the nonterminal after the dot
-                    log.debug(f"{item} => PREDICT")
-                    self._predict(next, i)
-                else:
-                    # Try to scan the terminal after the dot
-                    log.debug(f"{item} => SCAN")
-                    self._scan(item, i)                      
+                    self._attach(item, i)
+
+                # Even if final, there may also be next symbols; continue to predict/scan
+                for sym in grammar.next_nonterminals(item.lhs, item.state):
+                    if sym in self._allow_nt:
+                        # Predict this nonterminal at this position
+                        log.debug(f"{item} => PREDICT {sym}")
+                        self._predict(sym, i)
+
+                # Scan the next word if it matches what this item is looking for next
+                if i < len(tokens):
+                    self._scan(item, i)
+                    log.debug(f"{item} => SCAN '{tokens[i]}'")
 
     def _predict(self, nonterminal: str, position: int) -> None:
         """Start looking for this nonterminal at the given position."""
-        for rule in self.grammar.expansions(nonterminal):
-            new_item = Item(rule, dot_position=0, start_position=position)
-            new_weight = rule.weight
-            new_backptr = Backptr(kind='PREDICT', parent_item=None, parent_end=None,
-                                  child_item=None, child_end=None, terminal=None)
-            self.cols[position].push_or_move(new_item, new_weight, new_backptr)
-            log.debug(f"\tPredicted: {new_item} in column {position}")
-            self.profile["PREDICT"] += 1
+        if nonterminal not in self._allow_nt:
+            return
+        new_item = Item(lhs=nonterminal, state=0, start_position=position)
+        new_backptr = Backptr(kind='PREDICT', parent_item=None, parent_end=None,
+                                child_item=None, child_end=None, terminal=None)
+        cols = self.cols
+        cols[position].push_or_move(new_item, 0.0, new_backptr)
+        log.debug(f"\tPredicted: {new_item} in column {position}")
+        self.profile["PREDICT"] += 1
 
     def _scan(self, item: Item, position: int) -> None:
         """Attach the next word to this item that ends at position, 
         if it matches what this item is looking for next."""
-        if position < len(self.tokens) and self.tokens[position] == item.next_symbol():
-            new_item = item.with_dot_advanced()
-            new_weight = self.cols[position]._weight[item]  # no additional weight for scanning
+        tokens = self.tokens
+        grammar = self.grammar
+        cols = self.cols
+        child_state = grammar.advance(item.lhs, item.state, tokens[position]) if position < len(tokens) else None
+        if child_state is not None:
+            new_item = Item(lhs=item.lhs, state=child_state, start_position=item.start_position)
+            new_weight = cols[position]._weight[item]  # no additional weight for scanning
             new_backptr = Backptr(kind='SCAN', parent_item=item, parent_end=position,
-                                  child_item=None, child_end=None, terminal=self.tokens[position])
-            self.cols[position + 1].push_or_move(new_item, new_weight, new_backptr)
+                                  child_item=None, child_end=None, terminal=tokens[position])
+            cols[position + 1].push_or_move(new_item, new_weight, new_backptr)
             log.debug(f"\tScanned to get: {new_item} in column {position+1}")
             self.profile["SCAN"] += 1
 
@@ -179,17 +199,24 @@ class EarleyChart:
         customers' dots to create new items in this column.  (This operation is sometimes
         called "complete," but actually it attaches an item that was already complete.)
         """
+        cols = self.cols
+        grammar = self.grammar
         mid = item.start_position   # start position of this item = end position of item to its left
         # Use the column's index of waiting customers to avoid linear scan
         child = item
-        child_weight = self.cols[position]._weight[child]
+        # Completed child constituent weight includes the final rule weight at this trie node
+        child_prefix_weight = cols[position]._weight[child]
+        final_w = grammar.get_weight(child.lhs, child.state)
+        child_weight = child_prefix_weight + final_w # type: ignore
         child_end = position
-        for customer in self.cols[mid]._waiting.get(item.rule.lhs, ()):
-            new_item = customer.with_dot_advanced()
-            new_weight = self.cols[mid]._weight[customer] + child_weight
+        for customer in cols[mid]._waiting.get(item.lhs, ()): 
+            new_state = grammar.advance(customer.lhs, customer.state, item.lhs)
+            new_item = Item(lhs=customer.lhs, state=new_state, start_position=customer.start_position) # type: ignore
+            new_weight = cols[mid]._weight[customer] + child_weight
             # Create backpointer from new_item to customer and child
-            self.cols[position].push_or_move(new_item, new_weight, Backptr(kind='ATTACH', parent_item=customer, parent_end=position,
-                                                                             child_item=child, child_end=child_end, terminal=None))
+            new_backptr = Backptr(kind='ATTACH', parent_item=customer, parent_end=position,
+                                  child_item=child, child_end=child_end, terminal=None)
+            cols[position].push_or_move(new_item, new_weight, new_backptr)
             log.debug(f"\tAttached to get: {new_item} in column {position}")
             self.profile["ATTACH"] += 1
 
@@ -238,7 +265,7 @@ class Agenda:
 
     """
 
-    def __init__(self) -> None:
+    def __init__(self, grammar: 'SentenceGrammar') -> None:
         self._items: List[Item] = []       # list of all items that were *ever* pushed
         self._index: Dict[Item, int] = {}  # stores index of an item if it was ever pushed
         self._next = 0                     # index of first item that has not yet been popped
@@ -248,6 +275,7 @@ class Agenda:
 
         self._weight: Dict[Item, float] = {} # stores weight of each item
         self._backptr: Dict[Item, Backptr] = {} # stores backpointers for each item
+        self._grammar = grammar
 
         # Note: There are other possible designs.  For example, self._index doesn't really
         # have to store the index; it could be changed from a dictionary to a set.  
@@ -270,6 +298,11 @@ class Agenda:
     #         if sym is not None:
     #             self._waiting.setdefault(sym, []).append(item)
 
+    def _index_waiting(self, item: Item) -> None:
+        # Register item under each next nonterminal symbol from its trie state
+        for sym in self._grammar.next_nonterminals(item.lhs, item.state):
+            self._waiting.setdefault(sym, []).append(item)
+
     def push_or_move(self, item: Item, weight: float, backptr: Backptr) -> None:
         """Add (enqueue) the item, unless it was previously added.
         If it was previously added with a higher weight, update its weight and backpointer."""
@@ -277,9 +310,7 @@ class Agenda:
         if idx is None:
             self._items.append(item)
             self._index[item] = len(self._items) - 1
-            sym = item.next_symbol()
-            if sym is not None:
-                self._waiting.setdefault(sym, []).append(item)
+            self._index_waiting(item)
             self._weight[item] = weight
             self._backptr[item] = backptr
         elif weight < self._weight[item]:
@@ -315,7 +346,7 @@ class Agenda:
         return f"{self.__class__.__name__}({self._items[:next]}; {self._items[next:]})"
 
 class Grammar:
-    """Represents a weighted context-free grammar."""
+    """Represents a weighted context-free grammar with tries and reachability."""
     def __init__(self, start_symbol: str, *files: Path) -> None:
         """Create a grammar with the given start symbol, 
         adding rules from the specified files if any."""
@@ -324,6 +355,13 @@ class Grammar:
         # Read the input grammar files
         for file in files:
             self.add_rules_from_file(file)
+        # Build tries and reachability once
+        self._trie: Dict[str, List[TrieNode]] = {}
+        self._dir_terminals: Dict[str, set] = {}
+        self._adj: Dict[str, set] = {}
+        self._rev_adj: Dict[str, set] = {}
+        self._reachable_terminals: Dict[str, set] = {}
+        self._build_tries_and_reach()
 
     def add_rules_from_file(self, file: Path) -> None:
         """Add rules to this grammar from a file (one rule per line).
@@ -353,6 +391,60 @@ class Grammar:
         """Is symbol a nonterminal symbol?"""
         return symbol in self._expansions
 
+    def _build_tries_and_reach(self) -> None:
+        # Initialize structures
+        self._dir_terminals = {lhs: set() for lhs in self._expansions.keys()}
+        self._adj = {lhs: set() for lhs in self._expansions.keys()}
+        self._rev_adj = {lhs: set() for lhs in self._expansions.keys()}
+        # Build tries and collect direct terminals and nonterminal dependencies
+        for lhs, rules in self._expansions.items():
+            nodes: List[TrieNode] = [TrieNode(children={}, weight=None, nonterm_children=())]
+            for rule in rules:
+                cur = 0
+                for sym in rule.rhs:
+                    if self.is_nonterminal(sym):
+                        self._adj[lhs].add(sym)
+                        self._rev_adj.setdefault(sym, set()).add(lhs)
+                    else:
+                        self._dir_terminals.setdefault(lhs, set()).add(sym)
+                    if nodes[cur].children.get(sym) is None:
+                        nodes.append(TrieNode(children={}, weight=None, nonterm_children=()))
+                        nodes[cur].children[sym] = len(nodes) - 1
+                    cur = nodes[cur].children[sym]
+                if nodes[cur].weight is None or rule.weight < nodes[cur].weight:
+                    nodes[cur].weight = rule.weight
+            for nd in nodes:
+                nd.nonterm_children = tuple(sym for sym in nd.children.keys() if self.is_nonterminal(sym))
+            self._trie[lhs] = nodes
+        # Worklist to compute reachable terminals
+        reach: Dict[str, set] = {lhs: set(ts) for lhs, ts in self._dir_terminals.items()}
+        for lhs in self._expansions.keys():
+            reach.setdefault(lhs, set())
+            self._rev_adj.setdefault(lhs, set())
+        q = deque(self._expansions.keys())
+        while q:
+            y = q.popleft()
+            Ry = reach[y]
+            for p in self._rev_adj.get(y, ()):  # parents of y
+                Rp = reach[p]
+                before = len(Rp)
+                if Ry:
+                    Rp |= Ry
+                if len(Rp) != before:
+                    q.append(p)
+        self._reachable_terminals = reach
+
+    def advance(self, lhs: str, state: int, sym: str) -> Optional[int]:
+        return self._trie[lhs][state].children.get(sym)
+
+    def get_weight(self, lhs: str, state: int) -> Optional[float]:
+        return self._trie[lhs][state].weight
+
+    def next_nonterminals(self, lhs: str, state: int) -> Iterable[str]:
+        return self._trie[lhs][state].nonterm_children
+
+
+# (Merged Grammar; no SentenceGrammar subclass)
 
 # A dataclass is a class that provides some useful defaults for you. If you define
 # the data that the class should hold, it will automatically make things like an
@@ -390,34 +482,12 @@ class Rule:
 class Item:
     """An item in the Earley parse chart, representing one or more subtrees
     that could yield a particular substring."""
-    rule: Rule
-    dot_position: int
+    lhs: str
+    state: int
     start_position: int
-    # We don't store the end_position, which corresponds to the column
-    # that the item is in, although you could store it redundantly for 
-    # debugging purposes if you wanted.
-
-    def next_symbol(self) -> Optional[str]:
-        """What's the next, unprocessed symbol (terminal, non-terminal, or None) in this partially matched rule?"""
-        assert 0 <= self.dot_position <= len(self.rule.rhs)
-        if self.dot_position == len(self.rule.rhs):
-            return None
-        else:
-            return self.rule.rhs[self.dot_position]
-
-    def with_dot_advanced(self) -> Item:
-        if self.next_symbol() is None:
-            raise IndexError("Can't advance the dot past the end of the rule")
-        return Item(rule=self.rule, dot_position=self.dot_position + 1, start_position=self.start_position)
 
     def __repr__(self) -> str:
-        """Human-readable representation string used when printing this item."""
-        # Note: If you revise this class to change what an Item stores, you'll probably want to change this method too.
-        DOT = "·"
-        rhs = list(self.rule.rhs)  # Make a copy.
-        rhs.insert(self.dot_position, DOT)
-        dotted_rule = f"{self.rule.lhs} → {' '.join(rhs)}"
-        return f"({self.start_position}, {dotted_rule})"  # matches notation on slides
+        return f"({self.start_position}, {self.lhs} at {self.state} state)"
 
 @dataclass
 class Backptr:
@@ -429,22 +499,6 @@ class Backptr:
     child_end: Optional[int]
     terminal: Optional[str]
 
-    def __post_init__(self):
-        # Enforce field requirements based on kind
-        if self.kind == 'SCAN':
-            assert self.parent_item is not None
-            assert self.parent_end is not None
-            assert self.terminal is not None
-        elif self.kind == 'ATTACH':
-            assert self.parent_item is not None
-            assert self.parent_end is not None
-            assert self.child_item is not None
-            assert self.child_end is not None
-        elif self.kind == 'PREDICT':
-            pass
-        else:
-            raise ValueError(f"Unknown backpointer kind: {self.kind}")
-
     def __repr__(self) -> str:
         if self.kind == 'PREDICT':
             return f"PREDICT"
@@ -454,6 +508,15 @@ class Backptr:
             return f"ATTACH from {self.child_item} at {self.child_end} to {self.parent_item} at {self.parent_end}"
         else:
             return "UNKNOWN BACKPTR"
+
+@dataclass
+class TrieNode:
+    children: Dict[str, int]  # symbol -> child node id
+    weight: Optional[float] = None  # None if not end of rule, ≥0 if end of rule.
+    # Precomputed next nonterminal children for faster indexing
+    nonterm_children: Tuple[str, ...] = ()
+
+
 
 def main():
     # Parse the command-line arguments
