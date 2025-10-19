@@ -24,10 +24,10 @@ def parse_args() -> argparse.Namespace:
     """Parse command-line arguments"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "grammar", type=Path, help="Path to .gr file containing a PCFG'"
+        "grammar", type=Path, help="Path to .gr file containing a PCFG'", default='papa.gr'
     )
     parser.add_argument(
-        "sentences", type=Path, help="Path to .sen file containing tokenized input sentences"
+        "sentences", type=Path, help="Path to .sen file containing tokenized input sentences", default='papa.sen'
     )
     parser.add_argument(
         "-s",
@@ -333,6 +333,7 @@ class Item:
     def __repr__(self) -> str:
         """Human-readable representation string used when printing this item."""
         # Note: If you revise this class to change what an Item stores, you'll probably want to change this method too.
+
         DOT = "·"
         rhs = list(self.rule.rhs)  # Make a copy.
         rhs.insert(self.dot_position, DOT)

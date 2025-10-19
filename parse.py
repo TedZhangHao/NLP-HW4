@@ -72,7 +72,7 @@ class EarleyChart:
         self.cols: List[Agenda]
         self._run_earley()    # run Earley's algorithm to construct self.cols
 
-    def best_parse(self) -> str:
+    def best_parse(self) -> str: # added
         """Return the best parse as an S-expression, or a message if no parse was found."""
         # Find all complete items in the last column that span the whole input
         # and have the start symbol on their left-hand side.
@@ -88,7 +88,7 @@ class EarleyChart:
         # Reconstruct the parse tree from backpointers
         return self.build_trees(best_item, len(self.tokens))
 
-    def build_trees(self, item: Item, end: int) -> str:
+    def build_trees(self, item: Item, end: int) -> str: # added
         """Build an S-expression for a complete `item` that ends at column `end`.
         Walk back through backpointers, collecting children left-to-right.
         """
