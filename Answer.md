@@ -14,8 +14,12 @@ More surprisingly, for those sentences that are ambiguous, (e.g., prepositional 
 However, BNP deals very well with complex structures such as nested clauses and long dependency. For example, in the sentence "The cat that the dog, which was barking loudly, chased, was fast", BNP successfully assigned "fast" with "the cat".
 
 (c)
-"The more you push, the less you take."
-BNP failed parse "the less you take" ("the more", "the less") as an unknown phrase.
+1. "The more you push, the less you take."
+BNP parsed "more" as RBR (adverb comparative) and "less" as JJR (adjective comparative). But "more" should also be a JJR. This is a parsing mistake that caused by comparative correlative, a normal structure in English.
+2. "I saw the man in the park with the telescope."
+BNP attached "the telescope" with "the man in the park" as a NP. But smantically, this sentence is more likely to be intepreted as "the man in the park" is a NP, and "with the telescope" is a PP, which applys to subject 'I'. This is an attachment ambiguity that caused by additional adjunct.
+3. "Old men and teenagers are waiting outside."
+In this sentence, BNP couldn't decide to assign "old" to "the man" or "the man and teenagers". This is a NP bracketing ambiguity that the initial adjective could be applied to the first NP or all the NPs if the following ones does not have adjectives attached ahead.
 
 ## Q2
 (a) 
@@ -81,3 +85,11 @@ Wall Street parsing times (Using PyPy on M3 Max):
 | + E.2, E.4, and integerization (final `parse2.py`) | 71.97 |
 
 The final submission is over 12× faster than the unoptimized parser on this benchmark while still returning identical best parses.
+
+ ### Comment on Parses 
+ #### 1. Interesting points
+ 1. There are multiple tags with specific functions in the tree. For example, ADJP-PRD represents predictive adjective phrase, S-ADV represents adverbial clause, and S-NOM is nominalized clause. This style of parser tends to specify the syntax structure of the sentence instead of just NP, VP, and PP, which is more detailed and useful for understanding. The complex sentences are decomposed into deeply nested clauses such as SBAR (said the administration considered ...), S-ADV (... companies , projected to have ...), and S-NOM (critisized for issuing ...). This showcases that the parser prefers a fine-grained, function-oriented style rather than flatter analysis.  
+ 2.  Punctuation marks are explicitly represented as their own nodes instead of affiliate constituents, which is rare in parsers. 
+ #### 2. Correct and wrong things parser does
+ 1. The parser handled many difficult constructions correctly, such as predicative adjectives (“John is happy”, where 'happy' is assigned with ADJP-PRD), embedded complecx clauses (e.g., in “a senior intelligence official said the administration considered...”, multiple clauses are correctly parsed), and participial adverbials (“caught off guard” is tagged as S-ADV). 
+ 2. However, it also made some mistakes: proper names were sometimes split into multiple nodes (e.g., “Ford Motor Co.” is tagged as 3 consecutive NPPs, which should be regarded as a whole), complement structures like “data show that pay was flat” were parsed in a non-standard way (where 'pay' should be a noun yet was tagged as a verb), long sentences with multiple modifiers were somewhat cluttered ("running the combined ... Wall Street analysts."), and quotation marks were attached as separate punctuation nodes rather than integrated into the sentence structure (the last sentence in the example), which is quite weird.
